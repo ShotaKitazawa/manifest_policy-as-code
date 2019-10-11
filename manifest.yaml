@@ -1,0 +1,159 @@
+---
+# Namespace の定義
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test # 命名規則に従いKubernetsのネームスペースを作成
+---
+# 本番用 Service の定義
+apiVersion: v1
+kind: Service
+metadata:
+  name: sampleapp
+  namespace: test
+  annotations:
+    #cloud.google.com/neg: '{"ingress": true}'
+    #beta.cloud.google.com/backend-config: '{"ports": {"8080":"sampleapp"}}'
+spec:
+  ports:
+  - protocol: TCP
+    port: 8080  # Serviceの待ち受けるPort
+    targetPort: 8080  # Serviceの振り分け先PodのPort
+  selector: {}  # pod振り分け用selectorの付与は Argo-Rollout が行う
+  type: NodePort
+---
+# テスト用 Service の定義
+apiVersion: v1
+kind: Service
+metadata:
+  name: sampleapp-test
+  namespace: test
+  annotations:
+    #cloud.google.com/neg: '{"ingress": true}'
+    #beta.cloud.google.com/backend-config: '{"ports": {"8080":"sampleapp"}}'
+spec:
+  ports:
+  - protocol: TCP
+    port: 8080  # Serviceの待ち受けるPort
+    targetPort: 8080  # Serviceの振り分け先PodのPort
+  selector: {}  # pod振り分け用selectorの付与は Argo-Rollout が行う
+  type: NodePort
+---
+# Pod のオートスケーリング用の設定
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sampleapp
+  namespace: test
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: sampleapp
+  # 負荷テストを行い以下の値を決定する
+  maxReplicas: 10
+  minReplicas: 1
+  targetCPUUtilizationPercentage: 60
+---
+# Pod の evict 時の制御の設定
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: sampleapp
+  namespace: test
+spec:
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      feature: pdb
+---
+# Ingress の定義 (本番用とテスト用とで2つのドメインが必要)
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: sampleapp
+  namespace: test
+  annotations:
+    kubernetes.io/ingress.allow-http: "true"
+spec:
+  rules:
+    - host: sampleapp.local  # 本番用のドメイン
+      http:
+        paths:
+          - backend:
+              serviceName: sampleapp
+              servicePort: 8080
+    - host: test-sampleapp.local  # テスト用のドメイン
+      http:
+        paths:
+          - backend:
+              serviceName: sampleapp-test
+              servicePort: 8080
+
+---
+# Rollouts の定義
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: sampleapp
+  namespace: test
+  labels:
+    feature: pdb
+spec:
+  replicas: 3  # Pod数
+  selector:
+    matchLabels:
+      feature: pdb
+  template:
+    metadata:
+      annotations:
+        update-time: ${ new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new java.util.Date()) }
+      labels:
+        feature: pdb
+    spec:
+      containers:
+      - image: kanatakita/print-tag:v1
+        name: sampleapp
+        ports:
+        - name: port
+          containerPort: 8080  # Pod の待ち受けるPort
+        readinessProbe:
+          httpGet:
+            path: /  # ヘルスチェックパスを指定
+            port: port
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          timeoutSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /  # ヘルスチェックパスを指定
+            port: port
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          timeoutSeconds: 10
+        # 負荷テストを行い以下の値を決定する
+        resources:
+          requests:
+            cpu: 50m
+            memory: 256Mi
+          limits:
+            cpu: 100m
+            memory: 256Mi
+      - name: cloudsql-proxy
+        image: gcr.io/cloudsql-docker/gce-proxy:1.12
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          runAsUser: 2  # non-root user
+          allowPrivilegeEscalation: false
+  revisionHistoryLimit: 3
+  strategy:
+    blueGreen:
+      activeService: sampleapp
+      previewService: sampleapp-test
+      autoPromotionEnabled: false
